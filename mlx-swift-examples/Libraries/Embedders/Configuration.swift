@@ -76,6 +76,13 @@ private class ModelTypeRegistry: @unchecked Sendable {
             let model = Qwen3Model(configuration)
             return model
         },
+        "gemma3_text": {
+            url in
+            let configuration = try JSONDecoder().decode(
+                EmbeddingGemmaConfiguration.self, from: Data(contentsOf: url))
+            let model = EmbeddingGemmaModel(configuration)
+            return model
+        },
     ]
 
     public func registerModelType(
