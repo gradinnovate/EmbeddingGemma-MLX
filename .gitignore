@@ -1,0 +1,8 @@
+exclude/
+src/
+external/
+test/
+models/
+./mlx-swift-examples/.build
+./SwiftTests/.build
+./external/mlx-swift/.build
