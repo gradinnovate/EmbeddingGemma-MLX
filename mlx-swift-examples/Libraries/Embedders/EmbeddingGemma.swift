@@ -42,10 +42,6 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
         case slidingWindowPattern = "_sliding_window_pattern"
     }
 
-    enum VLMCodingKeys: String, CodingKey {
-        case textConfig = "text_config"
-    }
-
     public init(
         modelType: String,
         hiddenSize: Int,
@@ -81,13 +77,7 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        let nested = try decoder.container(keyedBy: VLMCodingKeys.self)
-        let container: KeyedDecodingContainer<CodingKeys>
-        if nested.contains(.textConfig) {
-            container = try nested.nestedContainer(keyedBy: CodingKeys.self, forKey: .textConfig)
-        } else {
-            container = try decoder.container(keyedBy: CodingKeys.self)
-        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
 
         self.modelType = try container.decode(String.self, forKey: .modelType)
         self.hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
@@ -126,7 +116,7 @@ private class EmbeddingGemmaAttention: Module {
     @ModuleInfo(key: "q_norm") var queryNorm: Gemma.RMSNorm
     @ModuleInfo(key: "k_norm") var keyNorm: Gemma.RMSNorm
 
-    @ModuleInfo var rope: RoPE
+    let rope: RoPE
 
     init(_ config: EmbeddingGemmaConfiguration, layerIdx: Int) {
         self.nHeads = config.attentionHeads
@@ -145,7 +135,7 @@ private class EmbeddingGemmaAttention: Module {
 
         let isSlidingLayer = (layerIdx + 1) % config.slidingWindowPattern != 0
         let baseFreq = isSlidingLayer ? config.ropeLocalBaseFreq : config.ropeGlobalBaseFreq
-        self._rope.wrappedValue = RoPE(
+        self.rope = RoPE(
             dimensions: headDim,
             traditional: config.ropeTraditional,
             base: baseFreq
@@ -156,7 +146,8 @@ private class EmbeddingGemmaAttention: Module {
 
     func callAsFunction(
         _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -171,8 +162,13 @@ private class EmbeddingGemmaAttention: Module {
         queries = queryNorm(queries)
         keys = keyNorm(keys)
 
-        queries = rope(queries)
-        keys = rope(keys)
+        if let cache {
+            queries = rope(queries, offset: cache.offset)
+            keys = rope(keys, offset: cache.offset)
+        } else {
+            queries = rope(queries)
+            keys = rope(keys)
+        }
 
         var finalMask = mask
         if case .array(let maskArray) = mask {
@@ -187,7 +183,7 @@ private class EmbeddingGemmaAttention: Module {
             queries: queries,
             keys: keys,
             values: values,
-            cache: nil,
+            cache: cache,
             scale: scale,
             mask: finalMask
         )
@@ -216,7 +212,7 @@ private class EmbeddingGemmaMLP: Module {
 
 private class EmbeddingGemmaBlock: Module {
     @ModuleInfo(key: "self_attn") var attention: EmbeddingGemmaAttention
-    @ModuleInfo var mlp: EmbeddingGemmaMLP
+    @ModuleInfo(key: "mlp") var mlp: EmbeddingGemmaMLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma.RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: Gemma.RMSNorm
     @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: Gemma.RMSNorm
@@ -239,10 +235,11 @@ private class EmbeddingGemmaBlock: Module {
 
     func callAsFunction(
         _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
     ) -> MLXArray {
         let inputNorm = inputLayerNorm(x)
-        let attnOut = attention(inputNorm, mask: mask)
+        let attnOut = attention(inputNorm, mask: mask, cache: cache)
         let attnNorm = postAttentionLayerNorm(attnOut)
         let residual = Gemma.clipResidual(x, attnNorm)
         let mlpInput = preFeedforwardLayerNorm(residual)
@@ -274,15 +271,60 @@ private class EmbeddingGemmaEncoder: Module {
 
     func callAsFunction(
         _ inputs: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache?]? = nil,
+        inputEmbeddings: MLXArray? = nil
     ) -> MLXArray {
-        var hidden = embedTokens(inputs)
+        var hidden: MLXArray
+        if let embeddings = inputEmbeddings {
+            hidden = embeddings
+        } else {
+            hidden = embedTokens(inputs)
+        }
         let scale = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
         hidden = hidden * scale.asType(hidden.dtype)
 
-        let baseMask = mask ?? createAttentionMask(h: hidden, cache: nil, returnArray: true)
-        for layer in layers {
-            hidden = layer(hidden, mask: baseMask)
+        var layerCache = cache
+        if layerCache == nil {
+            layerCache = Array(repeating: nil, count: layers.count)
+        }
+
+        var fullMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+        var slidingWindowMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+        if mask == nil {
+            let j = config.slidingWindowPattern
+            var globalMaskCaches: [KVCache]? = nil
+
+            if j > 0,
+                let caches = layerCache,
+                j <= caches.count,
+                let globalCache = caches[j - 1]
+            {
+                globalMaskCaches = [globalCache]
+            }
+
+            fullMask = createAttentionMask(h: hidden, cache: globalMaskCaches)
+
+            let allCaches = layerCache?.compactMap { $0 } ?? []
+            let slidingCaches = allCaches.isEmpty ? nil : allCaches
+            slidingWindowMask = createAttentionMask(h: hidden, cache: slidingCaches)
+        }
+
+        for (index, layer) in layers.enumerated() {
+            let isGlobalLayer =
+                index % config.slidingWindowPattern == config.slidingWindowPattern - 1
+
+            let localMask: MLXFast.ScaledDotProductAttentionMaskMode
+            if let mask {
+                localMask = mask
+            } else if isGlobalLayer {
+                localMask = fullMask
+            } else {
+                localMask = slidingWindowMask
+            }
+
+            let cacheEntry: KVCache? = layerCache?[index] ?? nil
+            hidden = layer(hidden, mask: localMask, cache: cacheEntry)
         }
         return norm(hidden)
     }
@@ -290,8 +332,7 @@ private class EmbeddingGemmaEncoder: Module {
 
 public class EmbeddingGemmaModel: Module, EmbeddingModel {
     @ModuleInfo(key: "model") private var encoder: EmbeddingGemmaEncoder
-    @ModuleInfo(key: "dense.0") private var dense0: Linear
-    @ModuleInfo(key: "dense.1") private var dense1: Linear
+    @ModuleInfo(key: "dense") private var dense: [Linear]
 
     public let vocabularySize: Int
     public let config: EmbeddingGemmaConfiguration
@@ -300,8 +341,10 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
         self.config = config
         self.vocabularySize = config.vocabularySize
         self._encoder.wrappedValue = EmbeddingGemmaEncoder(config)
-        self._dense0.wrappedValue = Linear(config.hiddenSize, config.hiddenSize * 4, bias: false)
-        self._dense1.wrappedValue = Linear(config.hiddenSize * 4, config.hiddenSize, bias: false)
+        self._dense.wrappedValue = [
+            Linear(config.hiddenSize, config.hiddenSize * 4, bias: false),
+            Linear(config.hiddenSize * 4, config.hiddenSize, bias: false)
+        ]
         super.init()
     }
 
@@ -323,10 +366,14 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
 
         let extendedMask = makeExtendedAttentionMask(validMask)
         let maskMode = MLXFast.ScaledDotProductAttentionMaskMode.array(extendedMask)
-
-        var hiddenStates = encoder(inputIds, mask: maskMode)
-        hiddenStates = dense0(hiddenStates)
-        hiddenStates = dense1(hiddenStates)
+        var hiddenStates = encoder(
+            inputIds,
+            mask: maskMode,
+            cache: nil,
+            inputEmbeddings: nil
+        )
+        hiddenStates = dense[0](hiddenStates)
+        hiddenStates = dense[1](hiddenStates)
 
         let pooled = meanPool(hiddenStates, attentionMask: validMask)
         let normalized = normalizeEmbeddings(pooled)
@@ -340,28 +387,47 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
 
+        let blockDensePattern = try! NSRegularExpression(
+            pattern: #"model\.layers\.(\d+)\.mlp\.(\d+)_Dense\.(\w+)"#
+        )
+
+        let rootDensePattern = try! NSRegularExpression(
+            pattern: #"^dense\.(\d+)\.(\w+)"#
+        )
+
         for (key, value) in weights {
-            if !key.contains("linear") && !key.contains("dense") {
-                let newKey = key.hasPrefix("model.") ? key : "model.\(key)"
-                sanitized[newKey] = value
-                continue
+            var newKey = key
+
+            if let match = blockDensePattern.firstMatch(
+                in: key,
+                options: [],
+                range: NSRange(location: 0, length: key.utf16.count)
+            ) {
+                let layerIndex = String(key[Range(match.range(at: 1), in: key)!])
+                let denseIndex = String(key[Range(match.range(at: 2), in: key)!])
+                let component = String(key[Range(match.range(at: 3), in: key)!])
+
+                let denseName: String
+                switch denseIndex {
+                case "0": denseName = "gate_proj"
+                case "1": denseName = "up_proj"
+                case "2": denseName = "down_proj"
+                default: denseName = "dense_\(denseIndex)"
+                }
+
+                newKey = "model.layers.\(layerIndex).mlp.\(denseName).\(component)"
+            } else if let match = rootDensePattern.firstMatch(
+                in: key,
+                options: [],
+                range: NSRange(location: 0, length: key.utf16.count)
+            ) {
+                let denseIndex = String(key[Range(match.range(at: 1), in: key)!])
+                let component = String(key[Range(match.range(at: 2), in: key)!])
+                newKey = "dense.\(denseIndex).\(component)"
             }
 
-            if key.contains("linear") && !key.contains("dense") {
-                let keyId = value.shape[0] > value.shape[1] ? "0" : "1"
-                let pattern = try! NSRegularExpression(pattern: #"(\d+)_Dense\.linear"#)
-                let range = NSRange(location: 0, length: key.utf16.count)
-                let replaced = pattern.stringByReplacingMatches(
-                    in: key,
-                    options: [],
-                    range: range,
-                    withTemplate: "dense.\(keyId)"
-                )
-                sanitized[replaced] = value
-                continue
-            }
-
-            sanitized[key] = value
+            print("sanitize: \(key) -> \(newKey)")
+            sanitized[newKey] = value
         }
 
         return sanitized
