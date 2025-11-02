@@ -23,6 +23,8 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
     public let queryPreAttnScalar: Float
     public let slidingWindow: Int
     public let slidingWindowPattern: Int
+    public let padTokenId: Int?
+    public let eosTokenId: Int?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -40,6 +42,8 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
         case queryPreAttnScalar = "query_pre_attn_scalar"
         case slidingWindow = "sliding_window"
         case slidingWindowPattern = "_sliding_window_pattern"
+        case padTokenId = "pad_token_id"
+        case eosTokenId = "eos_token_id"
     }
 
     public init(
@@ -57,7 +61,9 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
         ropeTraditional: Bool,
         queryPreAttnScalar: Float,
         slidingWindow: Int,
-        slidingWindowPattern: Int
+        slidingWindowPattern: Int,
+        padTokenId: Int? = nil,
+        eosTokenId: Int? = nil
     ) {
         self.modelType = modelType
         self.hiddenSize = hiddenSize
@@ -74,6 +80,8 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
         self.queryPreAttnScalar = queryPreAttnScalar
         self.slidingWindow = slidingWindow
         self.slidingWindowPattern = slidingWindowPattern
+        self.padTokenId = padTokenId
+        self.eosTokenId = eosTokenId
     }
 
     public init(from decoder: Decoder) throws {
@@ -99,6 +107,8 @@ public struct EmbeddingGemmaConfiguration: Codable, Sendable {
         self.slidingWindow = try container.decodeIfPresent(Int.self, forKey: .slidingWindow) ?? 512
         self.slidingWindowPattern =
             try container.decodeIfPresent(Int.self, forKey: .slidingWindowPattern) ?? 6
+        self.padTokenId = try container.decodeIfPresent(Int.self, forKey: .padTokenId) ?? 0
+        self.eosTokenId = try container.decodeIfPresent(Int.self, forKey: .eosTokenId) ?? 1
     }
 }
 
@@ -426,7 +436,9 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
                 newKey = "dense.\(denseIndex).\(component)"
             }
 
-            print("sanitize: \(key) -> \(newKey)")
+            if key != newKey {  
+                print("sanitize: \(key) -> \(newKey)")
+            }
             sanitized[newKey] = value
         }
 
