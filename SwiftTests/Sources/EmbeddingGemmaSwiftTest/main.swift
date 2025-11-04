@@ -8,6 +8,7 @@ import Tokenizers
 enum TestError: Error {
     case noTokens
     case missingEmbeddings
+    case unsupportedTokenizer
 }
 
 @main
@@ -23,8 +24,13 @@ struct EmbeddingGemmaSwiftTest {
             let configuration = ModelConfiguration(id: "mlx-community/embeddinggemma-300m-4bit")
             let container = try await loadModelContainer(configuration: configuration)
 
-            let embeddings = try await container.perform { model, tokenizer, _ -> MLXArray in
-                let eosId = tokenizer.eosTokenId ?? 0
+            let embeddings = try await container.perform { model, tokenizer, pooler -> MLXArray in
+                let padId: Int
+                if let gemma = model as? EmbeddingGemmaModel {
+                    padId = gemma.config.padTokenId ?? gemma.config.eosTokenId ?? tokenizer.eosTokenId ?? 0
+                } else {
+                    padId = tokenizer.eosTokenId ?? 0
+                }
                 let encodedSequences = sentences.map { sentence in
                     tokenizer.encode(text: sentence, addSpecialTokens: true)
                 }
@@ -33,14 +39,25 @@ struct EmbeddingGemmaSwiftTest {
                     throw TestError.noTokens
                 }
 
-                let paddedInputs = encodedSequences.map { sequence -> MLXArray in
-                    let paddingCount = max(0, maxLength - sequence.count)
-                    let padded = sequence + Array(repeating: eosId, count: paddingCount)
-                    return MLXArray(padded.map(Int32.init))
-                }
-                let inputIds = stacked(paddedInputs, axis: 0).asType(.int32)
+                var paddedRows = [MLXArray]()
+                var maskRows = [MLXArray]()
 
-                let attentionMask = (inputIds .!= MLXArray(Int32(eosId))).asType(.float16)
+                for sequence in encodedSequences {
+                    var row = sequence
+                    if sequence.count < maxLength {
+                        row += Array(repeating: padId, count: maxLength - sequence.count)
+                    }
+                    paddedRows.append(MLXArray(row.map(Int32.init)))
+
+                    var maskValues = Array(repeating: Int32(0), count: maxLength)
+                    for idx in 0..<sequence.count {
+                        maskValues[idx] = 1
+                    }
+                    maskRows.append(MLXArray(maskValues))
+                }
+
+                let inputIds = stacked(paddedRows, axis: 0).asType(.int32)
+                let attentionMask = stacked(maskRows, axis: 0)
 
                 let output = model(
                     inputIds,
@@ -48,16 +65,18 @@ struct EmbeddingGemmaSwiftTest {
                     tokenTypeIds: nil,
                     attentionMask: attentionMask
                 )
+                //print("Model output obtained. \(output)")
 
-                guard let pooled = output.pooledOutput else {
-                    throw TestError.missingEmbeddings
-                }
-
-                return pooled
+                return pooler(
+                    output,
+                    mask: attentionMask,
+                    normalize: true,
+                    applyLayerNorm: false
+                )
             }
 
-            let normalizedEmbeddings = embeddings
-            let similarity = normalizedEmbeddings.matmul(normalizedEmbeddings.transposed(1, 0))
+            let normalizedEmbeddings = embeddings.asType(.float32)
+            let similarity = normalizedEmbeddings.matmul(normalizedEmbeddings.transposed(1, 0)).asType(.float32)
 
             print("Similarity matrix between texts:")
             print(similarity)

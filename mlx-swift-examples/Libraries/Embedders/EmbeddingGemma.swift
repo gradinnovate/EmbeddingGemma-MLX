@@ -386,9 +386,10 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
         hiddenStates = dense[1](hiddenStates)
 
         let pooled = meanPool(hiddenStates, attentionMask: validMask)
-        print("validMask: \(validMask) pooled: \(pooled)")
+        //print("validMask: \(validMask) pooled: \(pooled)")
         let normalized = normalizeEmbeddings(pooled)
-        print("normalized: \(normalized)")
+        //print("normalized: \(normalized)")
+        //print("normalized shape: \(normalized.shape)")
 
         return EmbeddingModelOutput(
             hiddenStates: hiddenStates,
@@ -467,7 +468,7 @@ private func normalizeEmbeddings(_ embeddings: MLXArray, epsilon: Float = 1e-9) 
     let normValues = MLXLinalg.norm(embeddings32, ord: 2, axis: -1, keepDims: true)
     let denom = normValues + MLXArray(epsilon, dtype: .float32)
     let normalized32 = embeddings32 / denom
-    return normalized32.asType(embeddings.dtype)
+    return normalized32.asType(.float32)
 }
 
 private func makeExtendedAttentionMask(_ attentionMask: MLXArray) -> MLXArray {
