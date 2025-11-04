@@ -386,7 +386,9 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
         hiddenStates = dense[1](hiddenStates)
 
         let pooled = meanPool(hiddenStates, attentionMask: validMask)
+        print("validMask: \(validMask) pooled: \(pooled)")
         let normalized = normalizeEmbeddings(pooled)
+        print("normalized: \(normalized)")
 
         return EmbeddingModelOutput(
             hiddenStates: hiddenStates,
@@ -447,20 +449,25 @@ public class EmbeddingGemmaModel: Module, EmbeddingModel {
 }
 
 private func meanPool(_ tokenEmbeddings: MLXArray, attentionMask: MLXArray) -> MLXArray {
+    let embeddings32 = tokenEmbeddings.asType(.float32)
     var mask = attentionMask
-    if mask.dtype != tokenEmbeddings.dtype {
-        mask = mask.asType(tokenEmbeddings.dtype)
+    if mask.dtype != .float32 {
+        mask = mask.asType(.float32)
     }
 
     let expandedMask = mask.expandedDimensions(axes: [-1])
-    let sumEmbeddings = sum(tokenEmbeddings * expandedMask, axis: 1)
-    let sumMask = sum(expandedMask, axis: 1) + MLXArray(1e-9, dtype: tokenEmbeddings.dtype)
-    return sumEmbeddings / sumMask
+    let sumEmbeddings = sum(embeddings32 * expandedMask, axis: 1)
+    let sumMask = sum(expandedMask, axis: 1) + MLXArray(1e-9, dtype: .float32)
+    let pooled32 = sumEmbeddings / sumMask
+    return pooled32.asType(tokenEmbeddings.dtype)
 }
 
 private func normalizeEmbeddings(_ embeddings: MLXArray, epsilon: Float = 1e-9) -> MLXArray {
-    let normValues = MLXLinalg.norm(embeddings, ord: 2, axis: -1, keepDims: true)
-    return embeddings / (normValues + MLXArray(epsilon, dtype: embeddings.dtype))
+    let embeddings32 = embeddings.asType(.float32)
+    let normValues = MLXLinalg.norm(embeddings32, ord: 2, axis: -1, keepDims: true)
+    let denom = normValues + MLXArray(epsilon, dtype: .float32)
+    let normalized32 = embeddings32 / denom
+    return normalized32.asType(embeddings.dtype)
 }
 
 private func makeExtendedAttentionMask(_ attentionMask: MLXArray) -> MLXArray {
