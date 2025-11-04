@@ -1,0 +1,7 @@
+remote_theme: pages-themes/midnight@v0.2.0
+plugins:
+- jekyll-remote-theme # add this line to the plugins list if you already have one
+
+title: EmbeddingGemma-MLX
+tagline: "Swift MLX port of Google's EmbeddingGemma text encoder"
+description: "Implements the embeddinggemma-300m-4bit model in Swift with parity scripts, samples, and Hugging Face integration."
