@@ -1,3 +1,5 @@
+![EmbeddingGemma Banner](banner.png)
+
 # EmbeddingGemma-MLX
 
 This repository ports Google’s EmbeddingGemma text encoder to the Swift MLX stack by extending the `mlx-swift-examples` project. It provides a Swift implementation of the `embeddinggemma-300m-4bit` model, a sample executable that exercises the embedder, and parity scripts that verify the implementation against the original Python reference.
